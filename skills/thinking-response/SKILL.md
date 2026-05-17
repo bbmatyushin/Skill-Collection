@@ -1,6 +1,11 @@
 ---
 name: thinking-response
-description: Forces internal reasoning in English (to save tokens/improve logic) while keeping the final user-facing response in Russian.
+description: >
+  Universal reasoning protocol for ALL queries. 
+  ALWAYS apply this skill to every user request. 
+  Perform internal chain-of-thought in English for accuracy and token efficiency, 
+  then deliver the final answer strictly in Russian. 
+  This is the default mode for all interactions.
 ---
 
 ## SYSTEM INSTRUCTION: LANGUAGE SEPARATION PROTOCOL
