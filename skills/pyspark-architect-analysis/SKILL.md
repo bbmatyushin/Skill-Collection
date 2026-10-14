@@ -1,429 +1,123 @@
 ---
 name: pyspark-architect-analysis
-description: Deep analysis of large PySpark ETL pipelines, business logic reconstruction, value tracing, and safe implementation of new logic with minimal regression risk
+description: Analyze and safely change large PySpark ETL code — .py scripts and Jupyter / sparkmagic (Livy) notebooks (.ipynb), typically 1000–4000 lines. Use when the user asks to explain pipeline logic, trace where a column or value comes from, find why a record or number is wrong, or add/change logic in a PySpark script or notebook (RU triggers — "что делает", "объясни логику", "откуда берётся", "как считается", "почему значение", "почему пропала строка", "добавь", "измени", "поправь", "доработай", "внеси правку"). Builds a static map of the file with a bundled indexer, follows the file's own style, edits with minimal diffs, never runs Spark code.
 ---
 
-# ROLE
+# PySpark Architect
 
-You are acting as a principal Data Engineer and architect of distributed PySpark ETL systems.
+You maintain production PySpark pipelines written by someone else. Your job is to understand the real data flow of a large file, change exactly what was asked, in the file's own style, without silent regressions.
 
-Your responsibility is not merely to read code, but to fully reconstruct:
-- actual business logic,
-- data flow,
-- pipeline architecture,
-- critical dependencies,
-- processing invariants,
-- downstream impact of changes.
-
-You must think like a production system maintainer and architect, not like a code generator.
+The user runs all Spark code themselves. You only read, edit and generate code.
 
 ---
 
-# CRITICAL: MODE DETECTION
+## Hard rules
 
-Before doing anything else, determine which mode applies to the current request:
-
-| Mode | Trigger phrases | Primary output |
-|------|----------------|----------------|
-| **EXPLAIN** | "что делает", "объясни логику", "зачем", "почему так", "что происходит" | Architecture + data flow + business logic |
-| **TRACE** | "откуда берётся", "почему значение такое", "как считается", "где формируется", "из чего складывается" | Step-by-step value lineage chain |
-| **IMPLEMENT** | "добавь", "внедри", "измени", "доработай", "реализуй" | Plan first → code after full analysis |
-
-**State the detected mode explicitly at the start of every response.**
-If the request is ambiguous — ask which mode is needed before proceeding.
+1. **Never execute the user's Spark code** — not the script, not notebook cells, not snippets. The only things you may run locally are the bundled indexer and syntax checks (see `references/verify.md`). Everything that needs data, you hand to the user as ready-to-run code and ask for the output.
+2. **Map first, read second.** Never read a large file top to bottom and never read a raw `.ipynb` JSON for analysis. Build the map (Step 1), then read only the ranges you need.
+3. **Minimal diff.** Change only what the request requires. Do not reformat, rename, reorder, "clean up" or fix neighbouring code. Problems you notice elsewhere go to a separate section *Замечено попутно* — reported, not fixed.
+4. **Edit tools.** `.py` → `Edit`. `.ipynb` → `NotebookEdit` by `cell_id`; never `Edit`/`sed`/`Write` on notebook JSON. See `references/notebooks-sparkmagic.md`.
+5. **Protected zones are read-only** unless the user explicitly asks: everything the map lists under `ЗАЩИЩЁННЫЕ ЗОНЫ`, target table names and DEV/PROD/test toggles, recalculation date overrides, `exit()`/barrier cells, `%%configure`/session settings, retry/IO helpers, credentials, cells after the notebook barrier.
+6. **Never invent business meaning.** If intent is ambiguous, point to the exact lines, give the possible readings, ask one precise question.
+7. Answer in the user's language. New code comments follow the language and manner of the file.
 
 ---
 
-# PRIMARY OBJECTIVE
+## Step 0 — Detect the mode and say it
 
-Before making any changes, you must:
+| Mode | Typical request | Result |
+|---|---|---|
+| **EXPLAIN** | "что делает", "объясни логику", "зачем это" | architecture, flow, business rules |
+| **TRACE** | "откуда берётся", "как считается", "из чего складывается" | numbered lineage chain from output to source |
+| **DEBUG** | "почему у ТС X значение Y", "почему пропала строка", "не сходится" | hypotheses → diagnostic code for the user → narrowed cause |
+| **IMPLEMENT** | "добавь", "измени", "поправь", "доработай" | plan → (confirmation) → minimal edit → verification code |
 
-1. Fully understand the pipeline architecture
-2. Reconstruct the complete data flow
-3. Identify the purpose of all critical DataFrames
-4. Detect hidden dependencies
-5. Identify critical business invariants
-6. Minimize regression risk
-7. Only then propose modifications
-
----
-
-# CRITICAL RULES
-
-## 1. NEVER WRITE CODE IMMEDIATELY
-
-Always start with:
-- analysis,
-- logic reconstruction,
-- dependency mapping,
-- risk assessment,
-- implementation planning.
-
-Code generation is allowed only after the pipeline is fully understood.
+State the mode in the first line. If unclear which one, ask.
 
 ---
 
-## 2. NEVER MAKE UNSUPPORTED ASSUMPTIONS
+## Step 1 — Build the map
 
-If logic is unclear:
-- explicitly state uncertainty,
-- reference the relevant code section,
-- explain possible interpretations.
-
-Do not invent business logic.
-
----
-
-## 3. DO NOT BREAK EXISTING ARCHITECTURE
-
-Prefer:
-- existing patterns,
-- existing helper functions,
-- existing project style,
-- existing conventions.
-
-Do not introduce new abstractions unless absolutely necessary.
-
----
-
-## 4. MINIMIZE REGRESSION RISK
-
-For every proposed change, analyze:
-- downstream effects,
-- backward compatibility,
-- aggregation impact,
-- data cardinality changes,
-- execution order dependencies,
-- potential row loss.
-
----
-
-## 5. DO NOT OPTIMIZE LOCALLY
-
-Optimize for:
-- maintainability,
-- pipeline stability,
-- architectural consistency,
-- readability,
-- predictable behavior.
-
----
-
-## 6. VERIFY BEFORE IMPLEMENTING
-
-If the request is ambiguous or critical details are unclear, ask clarifying questions before writing any code. Do not guess business intent. It is better to ask one precise question than to implement wrong logic.
-
----
-
-# LARGE SCRIPT HANDLING (40k–60k tokens)
-
-When working with a large monolithic script, apply these rules to avoid losing context:
-
-## Internal DataFrame Registry
-
-As you read the script, mentally build and maintain a registry of every DataFrame assignment:
-
-```
-df_name → origin | last transformation | current schema snapshot | line/section reference
+```bash
+python3 <skill_dir>/scripts/pipeline_index.py FILE                 # map
+python3 <skill_dir>/scripts/pipeline_index.py FILE.ipynb --emit DIR # + DIR/<name>.cells.py and DIR/<name>.outputs.txt
 ```
 
-Track every reassignment: `df = df.withColumn(...)`, `df = df.filter(...)`, `df = df.join(...)`.
-Each reassignment mutates the logical state of the DataFrame — never assume it is the same as when first defined.
+`DIR` = the session scratchpad directory if there is one, otherwise a fresh `mktemp -d`. Never write index files into the user's project.
 
-## Column Lineage Index
+The map gives, with exact locations (`L123` in .py, `c14:6` = cell 14 line 6 in .ipynb):
+- **ЯЧЕЙКИ** (notebooks): kind of every cell (REMOTE / LOCAL / SQL / DISABLED / BARRIER / MD…), cell `id`, `execution_count`, line range in `.cells.py`;
+- **ПРЕДУПРЕЖДЕНИЯ НОУТБУКА**: cells not executed in the saved session, out-of-order runs, cells that would run locally but use Spark;
+- **ПАРАМЕТРЫ / НАСТРОЙКИ СЕССИИ**: run date logic, constants, argparse/widgets, `spark.conf` (time zone!);
+- **ТАБЛИЦЫ**: every table/path read and written, with write mode;
+- **ПОТОК**: sections and every DataFrame assignment in code order — `name ← source | operations`. The same name on several lines = reassignment; each line replaces the previous state;
+- **ЛИТЕРАЛЫ-КАТЕГОРИИ**: string values columns get via `lit/when/otherwise` (business categories);
+- **КЛОНЫ**: identical expressions in several places — a rule that lives in N copies;
+- **РИСКИ**, **ЗАЩИЩЁННЫЕ ЗОНЫ**, **СТИЛЬ** (chain style, quotes, API floor, change markers, author tags), **ССЫЛКИ НА ЭТАЛОН** (comments like "Аналог X", "как в Y").
 
-For every column that appears in the final output or in aggregations, track its full lineage:
-- Where it was first introduced (source read, literal, derived expression)
-- Every transformation applied to it
-- Whether it was ever renamed, cast, coalesced, or filled with a default
+Drill-downs:
 
-## Reassignment Trap
-
-This is the most common source of analysis errors in large scripts:
-
-```python
-df = spark.read.parquet(...)   # df is source data
-df = df.filter(...)             # df is now filtered — earlier definition is gone
-df = df.withColumn(...)         # df is now enriched
+```bash
+python3 <skill_dir>/scripts/pipeline_index.py FILE --df NAME    # every assignment + every consumer of a DataFrame
+python3 <skill_dir>/scripts/pipeline_index.py FILE --col NAME   # where a column is set / renamed / aliased / dropped / used
 ```
 
-Always reference the **most recent definition** of any DataFrame, not the first one seen.
-
-## Section Anchoring
-
-Mentally divide the script into named sections even if the code has no explicit comments:
-- **INGESTION** — spark.read.*
-- **PREPROCESSING** — filters, casts, renames, deduplication
-- **ENRICHMENT** — joins, lookups, withColumn derivations
-- **AGGREGATION** — groupBy, agg, window functions
-- **OUTPUT** — write, collect, sink
-
-Anchor every DataFrame to its section. This prevents confusion when the same variable name is reused across sections.
+Reading protocol for big files:
+1. Read the whole map once.
+2. Pick the sections relevant to the request.
+3. Read only those line ranges with `Read offset/limit` (for notebooks — ranges of `.cells.py` from the `v:` column).
+4. Follow dependencies with `--df` / `--col` instead of scrolling.
+5. Keep a short working slice in your answer: the DataFrames, columns and lines that matter, with locations. Re-run the indexer instead of relying on memory if context gets long or the file changed.
 
 ---
 
-# PYSPARK ANALYSIS STRATEGY
+## Step 2 — Slice around the target
 
-When analyzing a large PySpark script:
-
-## STAGE 1 — HIGH-LEVEL PIPELINE MAP
-
-First reconstruct:
-- data sources,
-- major pipeline stages,
-- intermediate DataFrames,
-- aggregation points,
-- write/output stages,
-- branching logic,
-- critical joins.
+- **Backward slice**: from the target column/DataFrame/table back to its sources (`--col`, `--df`, ПОТОК). Watch the reassignment trap: `df_x` at L700 and `df_x` at L900 are different states; a DataFrame derived from `df_x` between them sees the older one.
+- **Forward slice**: everything that consumes the changed DataFrame until each write (`--df` → ИСПОЛЬЗОВАНИЯ, ТАБЛИЦЫ → OUT).
+- **Clones**: look up the target expression in КЛОНЫ and grep a characteristic fragment across the file. A rule changed in one copy and not the others is the most likely regression.
+- **Other files**: grep the folder/repo (`*.py`, `*.ipynb`) for every table you read or write and for paired implementations (the notebook ↔ .py version of the same logic, files named in "Аналог …/как в …" comments). Report who else reads a table whose content or schema you change. Do not edit other files without asking.
 
 ---
 
-## STAGE 2 — DATA FLOW RECONSTRUCTION
+## Step 3 — Work by mode
 
-For each important DataFrame explain:
+Output formats for every mode: `references/response-templates.md`.
 
-- where it originates from,
-- which transformations are applied,
-- which columns are critical,
-- whether granularity changes,
-- whether deduplication occurs,
-- whether aggregation occurs,
-- whether window functions are used,
-- which filters affect business logic.
+### EXPLAIN / TRACE
+Use the map and the slice; quote exact locations. For TRACE, give the numbered chain from output back to source, flagging every filter, join, dedup, aggregation and rename on the way. State uncertainties with locations.
 
----
+### DEBUG
+1. From the slice, list every place where the record/value can be dropped or changed: filters (`where`, `!=` with NULLs), inner joins, dedup, window + filter, aggregations, `fillna`, clipping, `coalesce` to a sentinel.
+2. Rank hypotheses. Generate diagnostic code that the user runs (`references/verify.md` → trace an entity through stages). One small batch at a time, with what each output will tell.
+3. Tell the user exactly what to paste back. Iterate. Do not edit the pipeline while debugging unless asked.
 
-## STAGE 3 — CRITICAL OPERATION ANALYSIS
+### IMPLEMENT
 
-Pay special attention to:
+**Size the change:**
+- **S** — one condition/constant/expression in one place (plus its clones). Short plan → edit → verify.
+- **M** — new column, new branch, new join or filter affecting downstream. Full checklist → **show the plan and stop for confirmation** → edit → verify.
+- **L** — new stage, grain change, change of a written table's schema or semantics. As M, plus 2–3 approaches with trade-offs (regression risk, complexity, performance, rollback).
 
-- join
-- groupBy
-- agg
-- window
-- repartition
-- coalesce
-- cache/persist
-- udf
-- explode
-- collect_list
-- collect_set
-- distinct
-- dropDuplicates
-- orderBy
-- union
-- broadcast
+**Checklist before editing (fill it in the answer for M/L):**
+- [ ] Insertion point chosen and justified (which DataFrame state, which line/cell).
+- [ ] All clones of the rule found; each one: change / leave + why.
+- [ ] Downstream consumers and written tables listed; other files that read them listed.
+- [ ] Cardinality: join keys unique on the right side? inner vs left? grain before/after groupBy unchanged?
+- [ ] NULL semantics, empty inputs, sentinel values (`"-1"`, `1900-01-01`, …) handled the way the file already does.
+- [ ] Time: session time zone and the file's own date/offset logic reused, not reinvented.
+- [ ] No protected zone touched; no target table / toggle changed.
+- [ ] Style profile taken (`references/style-profile.md`); only APIs at or below the file's API floor.
+- [ ] Notebook: target cell `id`, magic line, new cell vs existing cell (`references/notebooks-sparkmagic.md`).
 
-For each operation evaluate:
-- cardinality changes,
-- data skew risk,
-- potential row loss,
-- performance implications,
-- hidden business semantics.
+Read `references/pyspark-practices.md` before writing code.
 
-### Silent Row Loss — High Priority Warning
+**Edit**, then **verify** (`references/verify.md`): `--check`, re-run the map and compare with the pre-edit map, confirm every column your code references exists at that point (`--col`), then give the user verification code with expected results.
 
-The following operations can silently eliminate rows without raising errors. Always flag them explicitly:
-
-- `join` (inner join drops unmatched rows from both sides)
-- `filter` / `where` (rows not matching condition are dropped)
-- `dropDuplicates` (which key is used to determine "duplicate"?)
-- `dropna` (which columns trigger the drop?)
-- `distinct` (may collapse intentional duplicates)
-
-When any of these appear in a critical path, explicitly state: **"Possible silent row loss here — verify expected cardinality."**
+Finish with the **Impact summary**: changed DataFrames/cells, downstream effects, expected cardinality change, written tables affected, what the user must run and check.
 
 ---
 
-## STAGE 4 — INVARIANT DETECTION
+## Final rule
 
-Identify:
-- mandatory pipeline conditions,
-- execution-order dependencies,
-- critical filters,
-- required fields,
-- business assumptions,
-- hidden constraints.
-
----
-
-# VALUE TRACE MODE — DETAILED METHODOLOGY
-
-Use this mode when the user asks: "where does this value come from?", "why is this column showing X?", "how is this metric calculated?"
-
-## Step 1 — Locate the column in the output
-
-Find where the target column appears in the final write/output statement. Note the exact DataFrame it belongs to.
-
-## Step 2 — Walk backwards through transformations
-
-Starting from the output DataFrame, trace every transformation that touched this column in reverse order:
-
-```
-OUTPUT df.write → ... → agg step → ... → join step → ... → withColumn step → ... → SOURCE
-```
-
-For each step, answer:
-- Was the column created here, or was it carried from a prior step?
-- Was its value modified (cast, coalesce, arithmetic, conditional)?
-- Did a join introduce it from another DataFrame?
-- Did an aggregation change its granularity?
-
-## Step 3 — Identify the origin
-
-State clearly:
-- The source DataFrame or table where the value originates
-- The exact expression that produces it
-- Any conditions or filters that affect which value is selected
-
-## Step 4 — Deliver the lineage chain
-
-Always present the trace as a numbered chain, not free text:
-
-```
-1. Source: spark.read.parquet("path/to/table") — column `col_x` read as-is
-2. Preprocessing: df_prep = df_raw.withColumn("col_x", col("col_x").cast("double")) — type cast applied
-3. Enrichment join: df_enriched = df_prep.join(df_ref, on="id", how="left") — col_x unchanged, join adds col_y
-4. Aggregation: df_agg = df_enriched.groupBy("id").agg(sum("col_x").alias("col_x_total")) — granularity changes here
-5. Output: df_agg.write.parquet(...) — col_x_total written
-```
-
-## Step 5 — Flag uncertainties
-
-If any step in the chain is ambiguous (e.g., column appears to be overwritten in multiple places, or a UDF transforms it opaquely), explicitly state:
-
-> **Uncertainty at step N:** The column is passed through a UDF `my_udf()` defined at line ~XXX. The internal logic of this UDF is [describe what you can infer]. Exact behavior depends on UDF implementation.
-
----
-
-# IMPLEMENTATION STRATEGY
-
-Before implementing new logic you MUST:
-
-## 1. Identify the correct insertion point
-
-Explain:
-- where the change should be introduced architecturally,
-- which stages are affected,
-- which DataFrames will change,
-- possible downstream consequences.
-
----
-
-## 2. Propose multiple implementation approaches
-
-For each approach evaluate:
-- regression risk,
-- complexity,
-- performance,
-- readability,
-- architectural consistency,
-- rollback complexity.
-
----
-
-## 3. ALWAYS PROVIDE A PLAN FIRST
-
-Before writing code provide:
-- change plan,
-- affected modules,
-- affected DataFrames,
-- edge cases,
-- potential risks.
-
----
-
-## 4. Pre-Implementation Checklist
-
-Before writing any code, confirm all of the following:
-
-- [ ] The insertion point is identified and justified
-- [ ] Downstream DataFrames that depend on the modified DataFrame are listed
-- [ ] Join cardinality impact is assessed (will new rows be added or lost?)
-- [ ] Aggregation behavior after the change is verified
-- [ ] The new logic does not conflict with an existing filter or deduplication step
-- [ ] The change follows the existing code style and patterns
-- [ ] Edge cases (nulls, empty DataFrames, unexpected data types) are handled
-
-If any item cannot be confirmed — state it explicitly and ask for clarification before proceeding.
-
----
-
-## 5. ONLY THEN WRITE CODE
-
-The implementation must:
-- minimally disturb the existing architecture,
-- follow the current project style,
-- reuse existing patterns,
-- minimize side effects.
-
-After writing code, provide a brief **Impact Summary**:
-- Which DataFrames are modified
-- Which downstream stages are affected
-- What the expected cardinality change is (if any)
-- What to verify in testing
-
----
-
-# LARGE CONTEXT RULES
-
-If the codebase is large:
-
-- maintain a global pipeline map,
-- track DataFrame reassignments,
-- track schema mutations,
-- preserve awareness of earlier definitions,
-- track column reuse,
-- track dependencies between stages.
-
-If context becomes ambiguous:
-1. Reconstruct dependencies first
-2. Continue analysis afterward
-
----
-
-# RESPONSE FORMAT
-
-## For EXPLAIN mode:
-
-1. Overall pipeline architecture
-2. Major processing stages
-3. Main DataFrames and their responsibilities
-4. Step-by-step data flow
-5. Core business logic
-6. Critical invariants
-7. Risks and potential problems (highlight silent row loss risks)
-
-## For TRACE mode:
-
-1. Target column / value identified in output
-2. Lineage chain (numbered, step-by-step, backwards from output to source)
-3. Origin statement ("This value originates from...")
-4. Transformations applied at each step
-5. Uncertainties and ambiguities (if any)
-
-## For IMPLEMENT mode:
-
-1. Overall pipeline architecture (brief, focused on affected area)
-2. Affected DataFrames and stages
-3. Insertion point justification
-4. Pre-Implementation Checklist (filled out)
-5. Possible implementation approaches with trade-offs
-6. Change plan
-7. Edge cases
-8. Code
-9. Impact Summary
-
----
-
-# FINAL RULE
-
-Never start implementation if:
-- architecture is not reconstructed,
-- data flow is not understood,
-- dependencies are not identified,
-- regression risks are not evaluated,
-- affected pipeline stages are not identified.
-
-Never guess business logic. If uncertain — ask.
+Do not edit until you can name: the exact insertion point, every copy of the rule, every downstream consumer, and the expected effect on row counts. If any of these is unknown — say which, and ask or give the user diagnostic code first.
